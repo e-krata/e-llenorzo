@@ -29,7 +29,7 @@ tokenURL = apiBaseURL + "/connect/token"
 // támogatott, ezért nincs szükség client_id-re, PKCE-re vagy
 // authorization-code flow-ra.
 
-userAgent = "eKretaStudent/264745 CFNetwork/1494.0.7 Darwin/23.4.0"
+userAgent = "eKrataDiak/260920"
 
 webUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) " +
 	"AppleWebKit/605.1.15 (KHTML, like Gecko) " +
