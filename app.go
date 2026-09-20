@@ -4,10 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"ellenorzo/backend/db"
-	"ellenorzo/backend/kreta"
-	"ellenorzo/backend/models"
-	"ellenorzo/backend/services"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -17,6 +13,11 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"ellenorzo/backend/db"
+	"ellenorzo/backend/kreta"
+	"ellenorzo/backend/models"
+	"ellenorzo/backend/services"
 
 	"github.com/go-pdf/fpdf"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -34,7 +35,7 @@ type App struct {
 
 func NewApp() *App {
 	return &App{
-		authSvc:   services.NewAuthService(),
+		authSvc:  services.NewAuthService(),
 		schoolSvc: services.NewSchoolService(),
 	}
 }
@@ -46,18 +47,38 @@ func (a *App) startup(ctx context.Context) {
 	if err != nil {
 		base = os.TempDir()
 	}
+
 	a.cacheDir = filepath.Join(base, "toll")
-	os.MkdirAll(a.cacheDir, 0755)
+
+	if err := os.MkdirAll(a.cacheDir, 0755); err != nil {
+		fmt.Printf("cache könyvtár létrehozása sikertelen: %v\n", err)
+	}
 
 	a.accountSvc = services.NewAccountService(a.cacheDir)
 	a.profileSvc = services.NewProfileService(a.cacheDir)
 
+	/*
+	 * Az AuthService automatikus refresh esetén frissíti
+	 * az aktív accounthoz tartozó tokeneket is.
+	 */
 	a.authSvc.SetOnRefresh(func(sess *models.Session) {
 		if stored := a.accountSvc.GetActive(); stored != nil {
-			a.accountSvc.UpdateTokens(stored.ID, sess.AccessToken, sess.RefreshToken, sess.ExpiresAt)
+			a.accountSvc.UpdateTokens(
+				stored.ID,
+				sess.AccessToken,
+				sess.RefreshToken,
+				sess.ExpiresAt,
+			)
 		}
 	})
 
+	/*
+	 * Az alkalmazás indulásakor megpróbáljuk visszaállítani
+	 * az előzőleg aktív fiókot.
+	 *
+	 * Ha az access token lejárt, az AuthService az elmentett
+	 * refresh token segítségével megpróbálja megújítani.
+	 */
 	a.accountSvc.TryRestoreActive(a.authSvc)
 
 	if cacheDB, err2 := db.Open(a.cacheDir); err2 == nil {
@@ -67,9 +88,11 @@ func (a *App) startup(ctx context.Context) {
 
 func (a *App) currentProfileID() string {
 	stored := a.accountSvc.GetActive()
+
 	if stored == nil {
 		return "default"
 	}
+
 	return stored.ID
 }
 
@@ -77,23 +100,153 @@ func (a *App) SearchInstitutes(query string) ([]models.Institute, error) {
 	return a.schoolSvc.Search(query)
 }
 
-func (a *App) Login(institute models.Institute, username, password string) (*models.AccountInfo, error) {
-	if len(a.accountSvc.GetAllAccounts()) >= 5 {
-		return nil, fmt.Errorf("legfeljebb 5 fiók adható hozzá")
+/*
+ * Login
+ *
+ * A frontend ezt a Wails metódust hívja:
+ *
+ *   Login(institute, username, password)
+ *
+ * A tényleges ÚjKréta OAuth2 hitelesítés a backend/kreta/auth.go
+ * Login() függvényében történik:
+ *
+ *   POST /connect/token
+ *
+ *   grant_type=password
+ *   username=<username>
+ *   password=<password>
+ *
+ * Az app.go feladata itt:
+ *
+ *   1. ellenőrizni a fióklimitet
+ *   2. meghívni a Kréta authentikációt
+ *   3. lekérni a tanuló profilját
+ *   4. eltárolni a sessiont
+ *   5. eltárolni az accountot
+ *   6. visszaadni az AccountInfo-t a frontendnek
+ */
+func (a *App) Login(
+	institute models.Institute,
+	username string,
+	password string,
+) (*models.AccountInfo, error) {
+	username = strings.TrimSpace(username)
+
+	if username == "" {
+		return nil, fmt.Errorf("a felhasználónév nem lehet üres")
 	}
 
-	session, err := kreta.Login(institute, username, password)
+	if password == "" {
+		return nil, fmt.Errorf("a jelszó nem lehet üres")
+	}
+
+	/*
+	 * Maximum 5 fiók tárolható.
+	 *
+	 * Fontos: ezt csak új fiók hozzáadásakor kellene ellenőrizni,
+	 * ezért először megpróbáljuk megkeresni, hogy a felhasználó
+	 * már szerepel-e.
+	 */
+	accounts := a.accountSvc.GetAllAccounts()
+
+	for _, account := range accounts {
+		if strings.EqualFold(account.Username, username) &&
+			account.Institute.InstituteCode == institute.InstituteCode {
+			/*
+			 * Meglévő fiók esetén is újrahitelesítünk.
+			 * Így a hibás/lejárt jelszó nem marad rejtve,
+			 * és az account tokenjei frissülnek.
+			 */
+			session, err := kreta.Login(
+				institute,
+				username,
+				password,
+			)
+
+			if err != nil {
+				return nil, err
+			}
+
+			name := account.Name
+
+			if student, profileErr := kreta.GetStudentProfile(session); profileErr == nil {
+				if strings.TrimSpace(student.Name) != "" {
+					name = student.Name
+				}
+			}
+
+			a.authSvc.SetSession(session)
+
+			info := a.accountSvc.UpsertAccount(
+				session,
+				name,
+			)
+
+			return info, nil
+		}
+	}
+
+	/*
+	 * Új account létrehozása előtt ellenőrizzük az 5 fiókos limitet.
+	 */
+	if len(accounts) >= 5 {
+		return nil, fmt.Errorf(
+			"legfeljebb 5 fiók adható hozzá",
+		)
+	}
+
+	/*
+	 * ÚjKréta OAuth2 password grant.
+	 *
+	 * A kreta.Login() küldi el:
+	 *
+	 * grant_type=password
+	 * username=username
+	 * password=password
+	 *
+	 * majd eltárolja:
+	 *
+	 * access_token
+	 * refresh_token
+	 * expires_at
+	 */
+	session, err := kreta.Login(
+		institute,
+		username,
+		password,
+	)
+
 	if err != nil {
 		return nil, err
 	}
 
+	/*
+	 * Sikeres autentikáció után lekérjük a tanuló nevét.
+	 *
+	 * Ha a profil lekérése valamilyen okból sikertelen,
+	 * akkor a felhasználónevet használjuk névként.
+	 */
 	name := username
-	if student, err := kreta.GetStudentProfile(session); err == nil {
-		name = student.Name
+
+	if student, profileErr := kreta.GetStudentProfile(session); profileErr == nil {
+		if strings.TrimSpace(student.Name) != "" {
+			name = student.Name
+		}
 	}
 
+	/*
+	 * Az új session lesz az alkalmazás aktuális sessionje.
+	 */
 	a.authSvc.SetSession(session)
-	info := a.accountSvc.UpsertAccount(session, name)
+
+	/*
+	 * Az accountSvc eltárolja a fiókot és a tokeneket.
+	 */
+	info := a.accountSvc.UpsertAccount(
+		session,
+		name,
+	)
+
 	return info, nil
 }
 
@@ -101,10 +254,13 @@ func (a *App) GetCurrentAccount() *models.AccountInfo {
 	if !a.authSvc.IsLoggedIn() {
 		return nil
 	}
+
 	stored := a.accountSvc.GetActive()
+
 	if stored == nil {
 		return nil
 	}
+
 	return &models.AccountInfo{
 		ID:            stored.ID,
 		Name:          stored.Name,
@@ -123,18 +279,23 @@ func (a *App) SwitchAccount(id string) (*models.AccountInfo, error) {
 	if err := a.accountSvc.SetActive(id); err != nil {
 		return nil, err
 	}
+
 	a.accountSvc.TryRestoreActive(a.authSvc)
+
 	return a.GetCurrentAccount(), nil
 }
 
 func (a *App) RemoveAccount(id string) error {
 	active := a.accountSvc.GetActive()
+
 	if err := a.accountSvc.Remove(id); err != nil {
 		return err
 	}
+
 	if active != nil && active.ID == id {
 		a.authSvc.Logout()
 	}
+
 	return nil
 }
 
@@ -151,6 +312,7 @@ func (a *App) GetStudentDetail() (*models.StudentDetail, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return kreta.GetStudentDetail(sess)
 }
 
@@ -160,6 +322,7 @@ func (a *App) GetGrades() ([]models.Grade, error) {
 		if a.db != nil {
 			return a.db.GetGrades(a.currentProfileID())
 		}
+
 		return nil, err
 	}
 
@@ -168,12 +331,17 @@ func (a *App) GetGrades() ([]models.Grade, error) {
 		if a.db != nil {
 			return a.db.GetGrades(a.currentProfileID())
 		}
+
 		return nil, err
 	}
 
 	if a.db != nil {
-		a.db.UpsertGrades(a.currentProfileID(), grades)
+		a.db.UpsertGrades(
+			a.currentProfileID(),
+			grades,
+		)
 	}
+
 	return grades, nil
 }
 
@@ -183,6 +351,7 @@ func (a *App) GetAbsences() ([]models.Absence, error) {
 		if a.db != nil {
 			return a.db.GetAbsences(a.currentProfileID())
 		}
+
 		return nil, err
 	}
 
@@ -191,12 +360,17 @@ func (a *App) GetAbsences() ([]models.Absence, error) {
 		if a.db != nil {
 			return a.db.GetAbsences(a.currentProfileID())
 		}
+
 		return nil, err
 	}
 
 	if a.db != nil {
-		a.db.UpsertAbsences(a.currentProfileID(), absences)
+		a.db.UpsertAbsences(
+			a.currentProfileID(),
+			absences,
+		)
 	}
+
 	return absences, nil
 }
 
@@ -210,26 +384,40 @@ func (a *App) GetAbsenceStats() ([]models.SubjectAbsenceStat, error) {
 		used  int
 		total int
 	}
+
 	m := make(map[string]*stat)
-	for _, a := range absences {
-		s := a.SubjectName
-		if m[s] == nil {
-			m[s] = &stat{}
+
+	for _, absence := range absences {
+		subject := absence.SubjectName
+
+		if m[subject] == nil {
+			m[subject] = &stat{}
 		}
-		m[s].used++
+
+		m[subject].used++
 	}
 
-	result := make([]models.SubjectAbsenceStat, 0, len(m))
-	for subj, s := range m {
-		result = append(result, models.SubjectAbsenceStat{
-			SubjectName: subj,
-			UsedHours:   s.used,
-			MaxHours:    32,
-		})
+	result := make(
+		[]models.SubjectAbsenceStat,
+		0,
+		len(m),
+	)
+
+	for subject, s := range m {
+		result = append(
+			result,
+			models.SubjectAbsenceStat{
+				SubjectName: subject,
+				UsedHours:   s.used,
+				MaxHours:    32,
+			},
+		)
 	}
+
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].SubjectName < result[j].SubjectName
 	})
+
 	return result, nil
 }
 
@@ -239,6 +427,7 @@ func (a *App) GetExams() ([]models.Exam, error) {
 		if a.db != nil {
 			return a.db.GetExams(a.currentProfileID())
 		}
+
 		return nil, err
 	}
 
@@ -247,12 +436,17 @@ func (a *App) GetExams() ([]models.Exam, error) {
 		if a.db != nil {
 			return a.db.GetExams(a.currentProfileID())
 		}
+
 		return nil, err
 	}
 
 	if a.db != nil {
-		a.db.UpsertExams(a.currentProfileID(), exams)
+		a.db.UpsertExams(
+			a.currentProfileID(),
+			exams,
+		)
 	}
+
 	return exams, nil
 }
 
@@ -261,7 +455,12 @@ func (a *App) GetTimetable(from, to string) ([]models.Lesson, error) {
 	if err != nil {
 		return nil, err
 	}
-	return kreta.GetTimetable(sess, from, to)
+
+	return kreta.GetTimetable(
+		sess,
+		from,
+		to,
+	)
 }
 
 func (a *App) GetHomework(from string) ([]models.Homework, error) {
@@ -269,80 +468,131 @@ func (a *App) GetHomework(from string) ([]models.Homework, error) {
 	if err != nil {
 		return nil, err
 	}
-	return kreta.GetHomework(sess, from)
+
+	return kreta.GetHomework(
+		sess,
+		from,
+	)
 }
 
 func (a *App) GetNotifications() ([]models.Notification, error) {
 	if a.db == nil {
 		return nil, nil
 	}
-	return a.db.GetNotifications(a.currentProfileID())
+
+	return a.db.GetNotifications(
+		a.currentProfileID(),
+	)
 }
 
 func (a *App) MarkRead(id int64) error {
 	if a.db == nil {
 		return nil
 	}
-	return a.db.MarkRead(a.currentProfileID(), id)
+
+	return a.db.MarkRead(
+		a.currentProfileID(),
+		id,
+	)
 }
 
 func (a *App) MarkAllRead() error {
 	if a.db == nil {
 		return nil
 	}
-	return a.db.MarkAllRead(a.currentProfileID())
+
+	return a.db.MarkAllRead(
+		a.currentProfileID(),
+	)
 }
 
 func (a *App) GetUnreadCount() (int, error) {
 	if a.db == nil {
 		return 0, nil
 	}
-	return a.db.UnreadCount(a.currentProfileID())
+
+	return a.db.UnreadCount(
+		a.currentProfileID(),
+	)
 }
 
 func (a *App) GetCountdowns() ([]models.Countdown, error) {
 	if a.db == nil {
 		return nil, nil
 	}
-	return a.db.GetCountdowns(a.currentProfileID())
+
+	return a.db.GetCountdowns(
+		a.currentProfileID(),
+	)
 }
 
-func (a *App) SaveCountdown(c models.Countdown) (models.Countdown, error) {
+func (a *App) SaveCountdown(
+	c models.Countdown,
+) (models.Countdown, error) {
 	if a.db == nil {
-		return c, fmt.Errorf("adatbázis nem elérhető")
+		return c, fmt.Errorf(
+			"adatbázis nem elérhető",
+		)
 	}
-	return a.db.SaveCountdown(a.currentProfileID(), c)
+
+	return a.db.SaveCountdown(
+		a.currentProfileID(),
+		c,
+	)
 }
 
 func (a *App) DeleteCountdown(id int64) error {
 	if a.db == nil {
 		return nil
 	}
-	return a.db.DeleteCountdown(a.currentProfileID(), id)
+
+	return a.db.DeleteCountdown(
+		a.currentProfileID(),
+		id,
+	)
 }
 
 func (a *App) ToggleCountdown(id int64) error {
 	if a.db == nil {
 		return nil
 	}
-	return a.db.ToggleCountdown(a.currentProfileID(), id)
+
+	return a.db.ToggleCountdown(
+		a.currentProfileID(),
+		id,
+	)
 }
 
 func (a *App) GetSubjectColors() ([]models.SubjectColor, error) {
 	if a.db == nil {
 		return nil, nil
 	}
-	return a.db.GetSubjectColors(a.currentProfileID())
+
+	return a.db.GetSubjectColors(
+		a.currentProfileID(),
+	)
 }
 
-func (a *App) SetSubjectColor(subject, color string) error {
+func (a *App) SetSubjectColor(
+	subject,
+	color string,
+) error {
 	if a.db == nil {
-		return fmt.Errorf("adatbázis nem elérhető")
+		return fmt.Errorf(
+			"adatbázis nem elérhető",
+		)
 	}
-	return a.db.SetSubjectColor(a.currentProfileID(), subject, color)
+
+	return a.db.SetSubjectColor(
+		a.currentProfileID(),
+		subject,
+		color,
+	)
 }
 
-func (a *App) GetTeacherProfile(teacherName string) (*models.TeacherProfile, error) {
+func (a *App) GetTeacherProfile(
+	teacherName string,
+) (*models.TeacherProfile, error) {
 	grades, err := a.GetGrades()
 	if err != nil {
 		return nil, err
@@ -352,6 +602,7 @@ func (a *App) GetTeacherProfile(teacherName string) (*models.TeacherProfile, err
 		Name:              teacherName,
 		GradeDistribution: make(map[int]int),
 	}
+
 	subjectSet := make(map[string]bool)
 	var sum float64
 
@@ -359,23 +610,33 @@ func (a *App) GetTeacherProfile(teacherName string) (*models.TeacherProfile, err
 		if g.Teacher != teacherName {
 			continue
 		}
-		if g.IsPercentage || g.Value < 1 || g.Value > 5 {
+
+		if g.IsPercentage ||
+			g.Value < 1 ||
+			g.Value > 5 {
 			continue
 		}
+
 		subjectSet[g.SubjectName] = true
 		profile.GradeDistribution[g.Value]++
 		sum += float64(g.Value)
 		profile.TotalGrades++
 	}
 
-	for s := range subjectSet {
-		profile.Subjects = append(profile.Subjects, s)
+	for subject := range subjectSet {
+		profile.Subjects = append(
+			profile.Subjects,
+			subject,
+		)
 	}
+
 	sort.Strings(profile.Subjects)
 
 	if profile.TotalGrades > 0 {
-		profile.AverageGrade = sum / float64(profile.TotalGrades)
+		profile.AverageGrade =
+			sum / float64(profile.TotalGrades)
 	}
+
 	return profile, nil
 }
 
@@ -386,7 +647,11 @@ func (a *App) GetChangesSinceLastOpen() ([]models.Change, error) {
 
 	lastOpen := a.db.GetMeta("last_open")
 	now := time.Now().Format(time.RFC3339)
-	a.db.SetMeta("last_open", now)
+
+	a.db.SetMeta(
+		"last_open",
+		now,
+	)
 
 	if lastOpen == "" || !a.authSvc.IsLoggedIn() {
 		return nil, nil
@@ -397,7 +662,11 @@ func (a *App) GetChangesSinceLastOpen() ([]models.Change, error) {
 		return nil, nil
 	}
 
-	changes, _ := a.db.SyncAll(sess, a.currentProfileID())
+	changes, _ := a.db.SyncAll(
+		sess,
+		a.currentProfileID(),
+	)
+
 	return changes, nil
 }
 
@@ -408,15 +677,21 @@ func (a *App) ExportGradesCSV() (string, error) {
 	}
 
 	var buf bytes.Buffer
+
 	buf.WriteString("\xef\xbb\xbf")
-	buf.WriteString("Tárgy;Dátum;Érték;Súly;Téma;Tanár;Típus\n")
+	buf.WriteString(
+		"Tárgy;Dátum;Érték;Súly;Téma;Tanár;Típus\n",
+	)
 
 	for _, g := range grades {
 		date := g.Date
+
 		if len(date) > 10 {
 			date = date[:10]
 		}
-		row := fmt.Sprintf("%s;%s;%s;%d;%s;%s;%s\n",
+
+		row := fmt.Sprintf(
+			"%s;%s;%s;%d;%s;%s;%s\n",
 			csvEscape(g.SubjectName),
 			date,
 			csvEscape(g.ValueText),
@@ -425,30 +700,60 @@ func (a *App) ExportGradesCSV() (string, error) {
 			csvEscape(g.Teacher),
 			csvEscape(g.TypeName),
 		)
+
 		buf.WriteString(row)
 	}
 
-	path, err := wailsRuntime.SaveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
-		DefaultFilename: "jegyek_" + time.Now().Format("2006-01-02") + ".csv",
-		Filters: []wailsRuntime.FileFilter{
-			{DisplayName: "CSV fájlok (*.csv)", Pattern: "*.csv"},
+	path, err := wailsRuntime.SaveFileDialog(
+		a.ctx,
+		wailsRuntime.SaveDialogOptions{
+			DefaultFilename:
+				"jegyek_" +
+					time.Now().Format("2006-01-02") +
+					".csv",
+
+			Filters: []wailsRuntime.FileFilter{
+				{
+					DisplayName: "CSV fájlok (*.csv)",
+					Pattern:     "*.csv",
+				},
+			},
 		},
-	})
+	)
+
 	if err != nil || path == "" {
 		return "", err
 	}
 
-	if err = os.WriteFile(path, buf.Bytes(), 0644); err != nil {
+	if err = os.WriteFile(
+		path,
+		buf.Bytes(),
+		0644,
+	); err != nil {
 		return "", err
 	}
+
 	return path, nil
 }
 
 func csvEscape(s string) string {
-	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(
+		s,
+		"\n",
+		" ",
+	)
+
 	if strings.ContainsAny(s, ";\"") {
-		s = "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
+		s =
+			"\"" +
+				strings.ReplaceAll(
+					s,
+					"\"",
+					"\"\"",
+				) +
+				"\""
 	}
+
 	return s
 }
 
@@ -460,56 +765,259 @@ func (a *App) ExportGradesPDF() (string, error) {
 
 	account := a.GetCurrentAccount()
 	name := ""
+
 	if account != nil {
 		name = account.Name
 	}
 
-	pdf := fpdf.New("P", "mm", "A4", "")
-	pdf.SetMargins(15, 15, 15)
+	pdf := fpdf.New(
+		"P",
+		"mm",
+		"A4",
+		"",
+	)
+
+	pdf.SetMargins(
+		15,
+		15,
+		15,
+	)
+
 	pdf.AddPage()
 
-	pdf.SetFont("Arial", "B", 16)
-	pdf.CellFormat(0, 10, safeStr("Jegyek – "+name), "", 1, "C", false, 0, "")
-	pdf.SetFont("Arial", "", 10)
-	pdf.CellFormat(0, 6, safeStr(time.Now().Format("2006-01-02")), "", 1, "C", false, 0, "")
+	pdf.SetFont(
+		"Arial",
+		"B",
+		16,
+	)
+
+	pdf.CellFormat(
+		0,
+		10,
+		safeStr("Jegyek – "+name),
+		"",
+		1,
+		"C",
+		false,
+		0,
+		"",
+	)
+
+	pdf.SetFont(
+		"Arial",
+		"",
+		10,
+	)
+
+	pdf.CellFormat(
+		0,
+		6,
+		safeStr(
+			time.Now().Format("2006-01-02"),
+		),
+		"",
+		1,
+		"C",
+		false,
+		0,
+		"",
+	)
+
 	pdf.Ln(4)
 
-	pdf.SetFillColor(39, 64, 41)
-	pdf.SetTextColor(255, 255, 255)
-	pdf.SetFont("Arial", "B", 10)
-	pdf.CellFormat(55, 7, safeStr("Tárgy"), "1", 0, "", true, 0, "")
-	pdf.CellFormat(25, 7, safeStr("Dátum"), "1", 0, "", true, 0, "")
-	pdf.CellFormat(20, 7, safeStr("Érték"), "1", 0, "C", true, 0, "")
-	pdf.CellFormat(20, 7, safeStr("Súly"), "1", 0, "C", true, 0, "")
-	pdf.CellFormat(60, 7, safeStr("Téma"), "1", 1, "", true, 0, "")
+	pdf.SetFillColor(
+		39,
+		64,
+		41,
+	)
 
-	pdf.SetTextColor(0, 0, 0)
-	pdf.SetFont("Arial", "", 9)
+	pdf.SetTextColor(
+		255,
+		255,
+		255,
+	)
+
+	pdf.SetFont(
+		"Arial",
+		"B",
+		10,
+	)
+
+	pdf.CellFormat(
+		55,
+		7,
+		safeStr("Tárgy"),
+		"1",
+		0,
+		"",
+		true,
+		0,
+		"",
+	)
+
+	pdf.CellFormat(
+		25,
+		7,
+		safeStr("Dátum"),
+		"1",
+		0,
+		"",
+		true,
+		0,
+		"",
+	)
+
+	pdf.CellFormat(
+		20,
+		7,
+		safeStr("Érték"),
+		"1",
+		0,
+		"C",
+		true,
+		0,
+		"",
+	)
+
+	pdf.CellFormat(
+		20,
+		7,
+		safeStr("Súly"),
+		"1",
+		0,
+		"C",
+		true,
+		0,
+		"",
+	)
+
+	pdf.CellFormat(
+		60,
+		7,
+		safeStr("Téma"),
+		"1",
+		1,
+		"",
+		true,
+		0,
+		"",
+	)
+
+	pdf.SetTextColor(
+		0,
+		0,
+		0,
+	)
+
+	pdf.SetFont(
+		"Arial",
+		"",
+		9,
+	)
+
 	fill := false
+
 	for _, g := range grades {
 		date := g.Date
+
 		if len(date) > 10 {
 			date = date[:10]
 		}
+
 		if fill {
-			pdf.SetFillColor(240, 244, 240)
+			pdf.SetFillColor(
+				240,
+				244,
+				240,
+			)
 		} else {
-			pdf.SetFillColor(255, 255, 255)
+			pdf.SetFillColor(
+				255,
+				255,
+				255,
+			)
 		}
+
 		fill = !fill
-		pdf.CellFormat(55, 6, safeStr(g.SubjectName), "1", 0, "", true, 0, "")
-		pdf.CellFormat(25, 6, safeStr(date), "1", 0, "", true, 0, "")
-		pdf.CellFormat(20, 6, safeStr(g.ValueText), "1", 0, "C", true, 0, "")
-		pdf.CellFormat(20, 6, fmt.Sprintf("%d%%", g.Weight), "1", 0, "C", true, 0, "")
-		pdf.CellFormat(60, 6, safeStr(g.Topic), "1", 1, "", true, 0, "")
+
+		pdf.CellFormat(
+			55,
+			6,
+			safeStr(g.SubjectName),
+			"1",
+			0,
+			"",
+			true,
+			0,
+			"",
+		)
+
+		pdf.CellFormat(
+			25,
+			6,
+			safeStr(date),
+			"1",
+			0,
+			"",
+			true,
+			0,
+			"",
+		)
+
+		pdf.CellFormat(
+			20,
+			6,
+			safeStr(g.ValueText),
+			"1",
+			0,
+			"C",
+			true,
+			0,
+			"",
+		)
+
+		pdf.CellFormat(
+			20,
+			6,
+			fmt.Sprintf("%d%%", g.Weight),
+			"1",
+			0,
+			"C",
+			true,
+			0,
+			"",
+		)
+
+		pdf.CellFormat(
+			60,
+			6,
+			safeStr(g.Topic),
+			"1",
+			1,
+			"",
+			true,
+			0,
+			"",
+		)
 	}
 
-	path, err := wailsRuntime.SaveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
-		DefaultFilename: "jegyek_" + time.Now().Format("2006-01-02") + ".pdf",
-		Filters: []wailsRuntime.FileFilter{
-			{DisplayName: "PDF fájlok (*.pdf)", Pattern: "*.pdf"},
+	path, err := wailsRuntime.SaveFileDialog(
+		a.ctx,
+		wailsRuntime.SaveDialogOptions{
+			DefaultFilename:
+				"jegyek_" +
+					time.Now().Format("2006-01-02") +
+					".pdf",
+
+			Filters: []wailsRuntime.FileFilter{
+				{
+					DisplayName: "PDF fájlok (*.pdf)",
+					Pattern:     "*.pdf",
+				},
+			},
 		},
-	})
+	)
+
 	if err != nil || path == "" {
 		return "", err
 	}
@@ -517,48 +1025,81 @@ func (a *App) ExportGradesPDF() (string, error) {
 	if err = pdf.OutputFileAndClose(path); err != nil {
 		return "", err
 	}
+
 	return path, nil
 }
 
-func (a *App) ExportTimetableICS(from, to string) (string, error) {
+func (a *App) ExportTimetableICS(
+	from,
+	to string,
+) (string, error) {
 	sess, err := a.authSvc.Session()
 	if err != nil {
 		return "", err
 	}
 
-	lessons, err := kreta.GetTimetable(sess, from, to)
+	lessons, err := kreta.GetTimetable(
+		sess,
+		from,
+		to,
+	)
+
 	if err != nil {
 		return "", err
 	}
 
 	name := "Órarend"
+
 	if account := a.GetCurrentAccount(); account != nil {
 		name = "Órarend – " + account.Name
 	}
 
-	ics := kreta.GenerateTimetableICS(lessons, name)
+	ics := kreta.GenerateTimetableICS(
+		lessons,
+		name,
+	)
 
-	path, err := wailsRuntime.SaveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
-		DefaultFilename: "orarend_" + time.Now().Format("2006-01-02") + ".ics",
-		Filters: []wailsRuntime.FileFilter{
-			{DisplayName: "iCalendar fájlok (*.ics)", Pattern: "*.ics"},
+	path, err := wailsRuntime.SaveFileDialog(
+		a.ctx,
+		wailsRuntime.SaveDialogOptions{
+			DefaultFilename:
+				"orarend_" +
+					time.Now().Format("2006-01-02") +
+					".ics",
+
+			Filters: []wailsRuntime.FileFilter{
+				{
+					DisplayName: "iCalendar fájlok (*.ics)",
+					Pattern:     "*.ics",
+				},
+			},
 		},
-	})
+	)
+
 	if err != nil || path == "" {
 		return "", err
 	}
 
-	if err := os.WriteFile(path, []byte(ics), 0644); err != nil {
+	if err := os.WriteFile(
+		path,
+		[]byte(ics),
+		0644,
+	); err != nil {
 		return "", err
 	}
+
 	return path, nil
 }
 
 func safeStr(s string) string {
 	var b strings.Builder
+
 	for _, r := range s {
-		if utf8.RuneLen(r) == 1 || (r >= 0x00C0 && r <= 0x00FF) {
+		if utf8.RuneLen(r) == 1 ||
+			(r >= 0x00C0 && r <= 0x00FF) {
+
 			b.WriteRune(r)
+
 		} else {
 			switch r {
 			case 'á':
@@ -602,6 +1143,7 @@ func safeStr(s string) string {
 			}
 		}
 	}
+
 	return b.String()
 }
 
@@ -609,10 +1151,13 @@ func (a *App) GetCurrentTheme() string {
 	if a.db == nil {
 		return "Zöld"
 	}
+
 	t := a.db.GetMeta("theme")
+
 	if t == "" {
 		return "Zöld"
 	}
+
 	return t
 }
 
@@ -620,17 +1165,24 @@ func (a *App) SetTheme(themeName string) {
 	if a.db == nil {
 		return
 	}
-	a.db.SetMeta("theme", themeName)
+
+	a.db.SetMeta(
+		"theme",
+		themeName,
+	)
 }
 
 func (a *App) GetCustomColor() string {
 	if a.db == nil {
 		return "#2d6a4f"
 	}
+
 	c := a.db.GetMeta("custom_color")
+
 	if c == "" {
 		return "#2d6a4f"
 	}
+
 	return c
 }
 
@@ -638,54 +1190,89 @@ func (a *App) SetCustomColor(color string) {
 	if a.db == nil {
 		return
 	}
-	a.db.SetMeta("custom_color", color)
+
+	a.db.SetMeta(
+		"custom_color",
+		color,
+	)
 }
 
 func (a *App) GetBellSchedule() []models.BellPeriod {
 	if a.db == nil {
 		return nil
 	}
-	raw := a.db.GetMeta("bell_schedule")
+
+	raw := a.db.GetMeta(
+		"bell_schedule",
+	)
+
 	if raw == "" {
 		return nil
 	}
+
 	var sched []models.BellPeriod
-	if err := json.Unmarshal([]byte(raw), &sched); err != nil {
+
+	if err := json.Unmarshal(
+		[]byte(raw),
+		&sched,
+	); err != nil {
 		return nil
 	}
+
 	return sched
 }
 
-func (a *App) SetBellSchedule(schedule []models.BellPeriod) error {
+func (a *App) SetBellSchedule(
+	schedule []models.BellPeriod,
+) error {
 	if a.db == nil {
-		return fmt.Errorf("adatbázis nem elérhető")
+		return fmt.Errorf(
+			"adatbázis nem elérhető",
+		)
 	}
+
 	data, err := json.Marshal(schedule)
 	if err != nil {
 		return err
 	}
-	a.db.SetMeta("bell_schedule", string(data))
+
+	a.db.SetMeta(
+		"bell_schedule",
+		string(data),
+	)
+
 	return nil
 }
 
 func (a *App) OpenGitHub() {
-	wailsRuntime.BrowserOpenURL(a.ctx, GitHubURL)
+	wailsRuntime.BrowserOpenURL(
+		a.ctx,
+		GitHubURL,
+	)
 }
 
 func (a *App) OpenDeveloper() {
-	wailsRuntime.BrowserOpenURL(a.ctx, DeveloperURL)
+	wailsRuntime.BrowserOpenURL(
+		a.ctx,
+		DeveloperURL,
+	)
 }
 
 func (a *App) GetLocalProfile() models.LocalProfile {
 	return a.profileSvc.Get()
 }
 
-func (a *App) SaveLocalProfile(profile models.LocalProfile) error {
+func (a *App) SaveLocalProfile(
+	profile models.LocalProfile,
+) error {
 	return a.profileSvc.Save(profile)
 }
 
 func (a *App) OpenDKT() {
-	wailsRuntime.BrowserOpenURL(a.ctx, "https://ekrata.ct.ws/dkttanulo")
+	wailsRuntime.BrowserOpenURL(
+		a.ctx,
+		"https://ekrata.ct.ws/dkttanulo",
+	)
 }
 
 type TaskItem struct {
@@ -706,78 +1293,44 @@ type FuzetEntry struct {
 }
 
 func (a *App) entriesPath() string {
-	return filepath.Join(a.cacheDir, "entries.json")
+	return filepath.Join(
+		a.cacheDir,
+		"entries.json",
+	)
 }
 
 func (a *App) loadAll() ([]FuzetEntry, error) {
-	data, err := os.ReadFile(a.entriesPath())
+	data, err := os.ReadFile(
+		a.entriesPath(),
+	)
+
 	if os.IsNotExist(err) {
 		return []FuzetEntry{}, nil
 	}
+
 	if err != nil {
 		return nil, err
 	}
+
 	var entries []FuzetEntry
-	if err := json.Unmarshal(data, &entries); err != nil {
+
+	if err := json.Unmarshal(
+		data,
+		&entries,
+	); err != nil {
 		return nil, err
 	}
+
 	return entries, nil
 }
 
-func (a *App) saveAll(entries []FuzetEntry) error {
-	data, err := json.MarshalIndent(entries, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(a.entriesPath(), data, 0644)
-}
+func (a *App) saveAll(
+	entries []FuzetEntry,
+) error {
+	data, err := json.MarshalIndent(
+		entries,
+		"",
+		"  ",
+	)
 
-func (a *App) LoadEntries() ([]FuzetEntry, error) {
-	return a.loadAll()
-}
-
-func (a *App) SaveEntry(entry FuzetEntry) error {
-	entries, err := a.loadAll()
-	if err != nil {
-		return err
-	}
-
-	now := time.Now().Format(time.RFC3339)
-
-	for i, e := range entries {
-		if e.ID == entry.ID {
-			entry.CreatedAt = e.CreatedAt
-			entry.UpdatedAt = now
-			entries[i] = entry
-			return a.saveAll(entries)
-		}
-	}
-
-	if entry.ID == "" {
-		b := make([]byte, 8)
-		rand.Read(b)
-		entry.ID = hex.EncodeToString(b)
-	}
-	entry.CreatedAt = now
-	entry.UpdatedAt = now
-	entries = append([]FuzetEntry{entry}, entries...)
-	return a.saveAll(entries)
-}
-
-func (a *App) DeleteEntry(id string) error {
-	entries, err := a.loadAll()
-	if err != nil {
-		return err
-	}
-	filtered := entries[:0]
-	for _, e := range entries {
-		if e.ID != id {
-			filtered = append(filtered, e)
-		}
-	}
-	return a.saveAll(filtered)
-}
-
-func (a *App) Greet(name string) string {
-	return fmt.Sprintf("Hello %s, It's show time!", name)
-}
+	if err != 
